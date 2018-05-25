@@ -539,8 +539,12 @@ class SsoAuthenticator(object):
         return saml_token
 
     def get_hok_saml_assertion(self,
-                               public_key,
                                private_key,
+                               public_key,
+                               username=None,
+                               password=None,
+                               delegateto=None,
+                               delegatetocert=None,
                                request_duration=60,
                                token_duration=600,
                                act_as_token=None,
@@ -579,17 +583,23 @@ class SsoAuthenticator(object):
         @rtype: C{str}
         @return: The SAML assertion in Unicode.
         '''
-        request = SecurityTokenRequest(public_key=public_key,
+        request = SecurityTokenRequest(username=username,
+                                       password=password,
+                                       delegateto=delegateto,
+                                       public_key=public_key,
                                        private_key=private_key,
                                        request_duration=request_duration,
                                        token_duration=token_duration)
         soap_message = request.construct_hok_request(delegatable=delegatable,
+                                                     delegateto=delegateto,
                                                      act_as_token=act_as_token,
                                                      renewable=renewable)
+        
         hok_token = self.perform_request(soap_message,
                                          public_key,
                                          private_key,
                                          ssl_context)
+        
         return etree.tostring(
             _extract_element(
                 etree.fromstring(hok_token),
@@ -600,6 +610,8 @@ class SsoAuthenticator(object):
     def get_token_by_token(self,
                            hok_token,
                            private_key,
+                           delegatable=False,
+                           delegateto=None,
                            request_duration=60,
                            token_duration=600,
                            renewable=False,
@@ -633,8 +645,9 @@ class SsoAuthenticator(object):
         request = SecurityTokenRequest(private_key=private_key,
                                        request_duration=request_duration,
                                        token_duration=token_duration,
-                                       hok_token=hok_token)
-        soap_message = request.construct_hok_by_hok_request(renewable=renewable)
+                                       hok_token=hok_token,
+                                       delegateto=delegateto)
+        soap_message = request.construct_hok_by_hok_request(renewable=renewable,delegatable=delegatable)
 
         soap_message = add_saml_context(soap_message, hok_token, private_key)
 
@@ -657,6 +670,7 @@ class SecurityTokenRequest(object):
     def __init__(self,
                  username=None,
                  password=None,
+                 delegateto=None,
                  public_key=None,
                  private_key=None,
                  request_duration=60,
@@ -693,6 +707,7 @@ class SecurityTokenRequest(object):
         self._signature_id = _generate_id()
         self._request_id = _generate_id()
         self._security_token_id = _generate_id()
+        self.delegateto = delegateto
         current = time.time()
         self._created = time.strftime(TIME_FORMAT,
                                       time.gmtime(current))
@@ -777,7 +792,7 @@ class SecurityTokenRequest(object):
         return _canonicalize(GSS_REQUEST_TEMPLATE % self.__dict__)
 
     def construct_hok_request(self, delegatable=False, act_as_token=None,
-                              renewable=False):
+                              renewable=False, username=None, password=None, delegateto=None):
         '''
         Constructs the actual HoK token SOAP request.
 
@@ -793,8 +808,14 @@ class SecurityTokenRequest(object):
         '''
         self._binary_security_token = base64.b64encode(
             _extract_certificate(self._public_key)).decode(UTF_8)
-        self._use_key = USE_KEY_TEMPLATE % self.__dict__
-        self._security_token = BINARY_SECURITY_TOKEN_TEMPLATE % self.__dict__
+        if delegateto is None:
+            self._use_key = USE_KEY_TEMPLATE % self.__dict__
+        else:
+            self._use_key = DELEGATE_TO_TEMPLATE % self.__dict__
+        if username is None:
+            self._security_token = USERNAME_HOK_TOKEN_TEMPLATE % self.__dict__
+        else:
+            self._security_token = BINARY_SECURITY_TOKEN_TEMPLATE % self.__dict__
         self._key_type = "http://docs.oasis-open.org/ws-sx/ws-trust/200512/PublicKey"
         self._renewable = str(renewable).lower()
         self._delegatable = str(delegatable).lower()
@@ -805,8 +826,8 @@ class SecurityTokenRequest(object):
             self._xml_text = ACTAS_REQUEST_TEMPLATE % self.__dict__
         self.sign_request()
         return etree.tostring(self._xml, pretty_print=False).decode(UTF_8)
-
-    def construct_hok_by_hok_request(self, renewable=False):
+    
+    def construct_hok_by_hok_request(self, renewable=False, delegatable=False):
         """
         @type    renewable: C{boolean}
         @param   renewable: Whether the generated token is renewable or not
@@ -816,6 +837,8 @@ class SecurityTokenRequest(object):
         """
         self._renewable = str(renewable).lower()
         self._key_type = "http://docs.oasis-open.org/ws-sx/ws-trust/200512/PublicKey"
+        self._use_key = DELEGATE_TO_TEMPLATE % self.__dict__
+        self._delegatable = delegatable
         return _canonicalize(REQUEST_TEMPLATE_TOKEN_BY_TOKEN) % self.__dict__
 
     def sign_request(self):
@@ -1150,7 +1173,7 @@ REQUEST_TEMPLATE_TOKEN_BY_TOKEN = """\
 <Renewing Allow="%(_renewable)s" OK="%(_renewable)s"/>
 <Delegatable>%(_delegatable)s</Delegatable>
 <KeyType>%(_key_type)s</KeyType>
-<SignatureAlgorithm>http://www.w3.org/2001/04/xmldsig-more#rsa-sha256</SignatureAlgorithm>
+<SignatureAlgorithm>http://www.w3.org/2001/04/xmldsig-more#rsa-sha256</SignatureAlgorithm>%(_use_key)s
 </RequestSecurityToken>
 </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"""
@@ -1202,9 +1225,27 @@ USERNAME_TOKEN_TEMPLATE = """\
 <ns2:Password>%(_password)s</ns2:Password>
 </ns2:UsernameToken>"""
 
+#Template container for user's credentials when requesting a HOK token.
+USERNAME_HOK_TOKEN_TEMPLATE = """\
+<ns2:BinarySecurityToken xmlns:ns1="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
+                         xmlns:ns2="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+                         EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"
+                         ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3"
+                         ns1:Id="%(_security_token_id)s">%(_binary_security_token)s</ns2:BinarySecurityToken>
+<ns2:UsernameToken xmlns:ns2="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+<ns2:Username>%(_username)s</ns2:Username>
+<ns2:Password>%(_password)s</ns2:Password>
+</ns2:UsernameToken>"""
+
 #Template containing the anchor to the signature.
 USE_KEY_TEMPLATE = """\
 <UseKey Sig="%(_signature_id)s"/>"""
+
+#Template containing the user for delegation.
+DELEGATE_TO_TEMPLATE = """\
+<DelegateTo><ns2:UsernameToken xmlns:ns2="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+<ns2:Username>%(delegateto)s</ns2:Username>
+</ns2:UsernameToken></DelegateTo>"""
 
 #The follwoing template is used to create a timestamp for the various messages.
 #The timestamp is used to indicate the duration of the request itself.
